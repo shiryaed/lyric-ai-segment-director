@@ -6,7 +6,7 @@
 'use strict';
 
 // 每次改动改这个数字：面板会显示它，用来确认 Folia 跑的是不是最新代码。
-const BUILD_TAG = 'b79';
+const BUILD_TAG = 'b83';
 
 const T = (zh, en) => ({ 'zh-CN': zh, en });
 
@@ -902,29 +902,21 @@ const createHostAdapter = (folium) => {
     } catch { return 'normal'; }
   };
 
-  const themeStore = () => internalsOf(folium)?.stores?.themeSettings ?? null;
-
   /* 写动画强度。
-   * 宿主的 setTheme 实现是：setTheme(e) => { 若 e.animationIntensity 合法则写进 localStorage；再用 localStorage 的值覆盖 e }
-   * 所以调用 setTheme 时必须把新强度一并传进去，否则旧值会把刚写的新值覆盖掉（这就是之前“强度没生效”的原因）。
-   * @param {boolean} flush 是否立刻让宿主重读（只在确实同时切了模式时才用） */
-  const setIntensity = (value, flush = false) => {
+   *
+   * 事实（已实测）：`folium.internals.stores` 只暴露 5 个 store（playback / appView /
+   * visualizerSettings / themeSettings / lyricSettings），**没有一个带 setTheme 或 theme**。
+   * 宿主那个真正应用主题的 store 没有暴露给模组，所以“立刻让强度生效”这条路走不通。
+   *
+   * 能做的只有：把强度写进宿主读的那个 localStorage key。
+   * 宿主会在下次重建场景时（切模式、换歌、手动改主题）重新读取它，
+   * 因此强度的实际生效时机是「下一次模式切换」。
+   *
+   * 值没变就直接返回（没必要重复写）。 */
+  const setIntensity = (value) => {
     if (!INTENSITIES.includes(value)) return false;
-    const changed = value !== readIntensity();
-    if (!changed && !flush) return false;
-    if (changed) {
-      try { localStorage.setItem(INTENSITY_KEY, value); } catch { return false; }
-    }
-    if (!flush) return changed;
-    // 与切模式同一次重建里刷新：把新强度随主题一起交给宿主
-    try {
-      const st = themeStore()?.getState?.();
-      if (st?.theme && typeof st.setTheme === 'function') {
-        markOwnWrite();
-        st.setTheme({ ...st.theme, animationIntensity: value });
-      }
-    } catch { /* 拿不到主题就等下次应用 */ }
-    return true;
+    if (value === readIntensity()) return false;
+    try { localStorage.setItem(INTENSITY_KEY, value); return true; } catch { return false; }
   };
 
   return {
@@ -1789,7 +1781,7 @@ const createDirector = ({ folium, host, settings, onChange, hostAudit = null }) 
         host.setParams(seg.mode, seg.params);
       }
       host.setClean(seg.mode);
-      if (seg.intensity) host.setIntensity(seg.intensity, true);
+      if (seg.intensity && settings().applyIntensity) host.setIntensity(seg.intensity);
       if (seg.bg) host.setBackground(seg.bg);
       current.segAt = performance.now();
       return true;
@@ -1807,10 +1799,14 @@ const createDirector = ({ folium, host, settings, onChange, hostAudit = null }) 
     /* 目标模式与当前完全一致时，不该再压暗一遍：
      * 宿主 setMode 对相同模式是空操作（不会重建），遮罩却会白跑一轮，表现为“莫名黑一下”。
      * 分三种情况处理：
-     *   1) 模式 + 参数 + 强度 + 背景 全同 → 什么都不做；
-     *   2) 模式相同，但参数/强度/背景有变化 → 直接改，不压暗（这些不重建场景）；
+     *   1) 模式 + 参数 + 背景 全同 → 什么都不做；
+     *   2) 模式相同，但参数/背景有变化 → 直接改，不压暗（这些不重建场景）；
      *   3) 模式不同 → 正常走过渡。
-     * `force` 用于跳播/接管等场景：即使全同也重新应用一次（保证画面正确）。 */
+     * `force` 用于跳播/接管等场景：即使全同也重新应用一次（保证画面正确）。
+     *
+     * 注意：动画强度不参与上面的判断。强度不能立即重绘（宿主没暴露接口），
+     * 若让“强度变了”成为“需要切换”的理由，只会把新值提前写进 localStorage，
+     * 导致下一段读到的强度错位。所以强度只在「切模式/切背景」时顺带写。 */
     const sameMode = !force && host.currentMode() === seg.mode;
     if (sameMode) {
       // 参数是否真的需要改：逐键与当前 tuning 比对，全部相同就不算“要改”
@@ -1822,11 +1818,10 @@ const createDirector = ({ folium, host, settings, onChange, hostAudit = null }) 
         if (!now) return true;
         return Object.entries(want).some(([k, v]) => now[k] !== v);
       })();
-      const curIntensity = host.readIntensity();
-      const wantIntensity = Boolean(seg.intensity) && seg.intensity !== curIntensity;
       const curBg = host.readBackground();
       const wantBg = Boolean(seg.bg) && seg.bg !== curBg;
-      if (!wantParams && !wantIntensity && !wantBg) {
+      // A1/A2：只看参数和背景，强度不参与。否则“同模式只改强度”会空跑且写错值。
+      if (!wantParams && !wantBg) {
         // 全同：彻底跳过。但要把 segAt 记上，否则最小间隔判定会以为“刚切过”，
         // 后续段也可能被误压住。
         current.segAt = performance.now();
@@ -1841,7 +1836,6 @@ const createDirector = ({ folium, host, settings, onChange, hostAudit = null }) 
         current.expectedUntil = performance.now() + 2000;
         if (wantParams) host.setParams(seg.mode, seg.params);
         host.setClean(seg.mode);
-        if (wantIntensity) host.setIntensity(seg.intensity, true);
         if (wantBg) host.setBackground(seg.bg);
         current.segAt = performance.now();
         emit();
@@ -1868,8 +1862,8 @@ const createDirector = ({ folium, host, settings, onChange, hostAudit = null }) 
         host.setClean(seg.mode);
         // 重模式临时降画质，换切换时的流畅（会自动恢复）
         applyTempQuality(seg.mode);
-        // 动画强度跟着这一段走：和切模式放在同一次重建里刷新，不单独触发主题重应用
-        if (seg.intensity) host.setIntensity(seg.intensity, true);
+        // 动画强度跟着这一段走：写进宿主读的那个 key，随这次模式重建一起生效
+        if (seg.intensity && settings().applyIntensity) host.setIntensity(seg.intensity);
         // 背景类型也跟着这一段走（只写 visualizer_background_mode，不动主题/配色）
         if (seg.bg) host.setBackground(seg.bg);
         current.segAt = performance.now();
@@ -2311,8 +2305,8 @@ const createDirector = ({ folium, host, settings, onChange, hostAudit = null }) 
      * 只用它会导致“重启后恢复设置，强度和背景回不去”。 */
     const wantIntensity = originalIntensity ?? saved?.intensity ?? null;
     const wantBackground = originalBackground ?? saved?.background ?? null;
-    // C1：必须 flush，否则只写 localStorage 不生效，要等下次切段才应用
-    if (wantIntensity) host.setIntensity(wantIntensity, true);
+    // 恢复动作不受「同时调整动画强度」开关影响：这是把用户的设置还回去，必须做
+    if (wantIntensity) host.setIntensity(wantIntensity);
     if (wantBackground) host.setBackground(wantBackground);
     originalIntensity = null;
     originalBackground = null;
@@ -2626,8 +2620,8 @@ export default async function activate(folium) {
       const vs = i.stores?.visualizerSettings?.getState?.();
       if (typeof vs?.handleSetVisualizerMode !== 'function') missing.push('handleSetVisualizerMode');
       if (typeof vs?.handleSetVisualizerBackgroundMode !== 'function') missing.push('handleSetVisualizerBackgroundMode');
-      const ts = i.stores?.themeSettings?.getState?.();
-      if (typeof ts?.setTheme !== 'function') missing.push('themeSettings.setTheme');
+      /* 不再检查 themeSettings.setTheme：实测 internals 暴露的 5 个 store 都没有 setTheme，
+       * 那是宿主内部接口，本来就不该由这里断言。强度走 localStorage，不需要它。 */
       // 播放与歌词
       if (typeof folium.playback?.getState !== 'function') missing.push('playback.getState');
       if (typeof folium.lyrics?.getLines !== 'function') missing.push('lyrics.getLines');
@@ -2689,6 +2683,10 @@ export default async function activate(folium) {
       defaultValue: true },
     { key: 'applyParams', type: 'boolean', group: T('行为', 'Behaviour'), label: T('同时调整参数', 'Apply parameters too'),
       description: T('关闭则只切换模式，参数保持你手调的', 'Off: switch the mode only'), defaultValue: true },
+    { key: 'applyIntensity', type: 'boolean', group: T('行为', 'Behaviour'), label: T('同时调整动画强度', 'Apply animation intensity too'),
+      description: T('AI 会给每段指定平静/正常/混乱。注意：强度只能写进设置，要等下一次模式切换才真正生效（宿主没给模组立即重绘的接口）',
+        'AI assigns calm/normal/chaotic per segment. Note: it only takes effect at the next mode switch (the host exposes no immediate re-render)'),
+      defaultValue: true },
     { key: 'hardLimit', type: 'boolean', group: T('行为', 'Behaviour'), label: T('硬限制每段 2~4 句', 'Hard limit 2-4 lines per segment'),
       description: T('开启后强制每段 2~4 句；关闭后段长完全由 AI 决定', 'On: force 2-4 lines per segment'), defaultValue: true },
     { key: 'transition', type: 'boolean', group: T('行为', 'Behaviour'), label: T('切换时闪黑过渡', 'Flash transition on switch'),
@@ -2721,6 +2719,7 @@ export default async function activate(folium) {
       autoDirect: v.autoDirect !== false,
       prefetchNext: v.prefetchNext !== false,
       applyParams: v.applyParams !== false,
+      applyIntensity: v.applyIntensity !== false,
       hardLimit: v.hardLimit !== false,
       transition: v.transition !== false,
       lead: Number(v.lead ?? 0.9),

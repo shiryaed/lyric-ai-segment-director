@@ -6,7 +6,7 @@
 'use strict';
 
 // 每次改动改这个数字：面板会显示它，用来确认 Folia 跑的是不是最新代码。
-const BUILD_TAG = 'b57';
+const BUILD_TAG = 'b79';
 
 const T = (zh, en) => ({ 'zh-CN': zh, en });
 
@@ -528,13 +528,22 @@ const PROFILES = {
   nebbia: { name: '雾笺', host: '在起雾的公交车窗上写歌词，字随车行、雨点与霓虹一起流动' },
   still: { name: '静止', host: '歌词静止在画面中央，不做动画也不渲染背景，最省资源' },
   // ---- 第三方动画（mode 形如 mod:<模组id>:<动画id>）。这里补画像，否则 AI 只看到名字、不知道画面长什么样，就不会选。
+  // id 取自各模组 client.mjs 里 registries.visualizers.register 的 id，与 mod.json 的模组 id 拼成完整 mode。
   'mod:cinerama:cinerama-screen': { name: '巨幕', host: '舞台 LED 大屏：大字报、跑马灯带、斜切丝带轮换，歌词像被投在演唱会的巨幕上' },
   'mod:visualizer-jump:jump-course': { name: '跳一跳', host: '等距小游戏场景：小人在一块块带字的长方块上跳跃前进，跳到哪块就唱哪句' },
-  'mod:vinyl-disc:vinyl': { name: '黑胶唱片', host: '黑胶唱机：封面作碟心，唱片旋转、唱臂落下，歌词在唱片旁边排布' },
+  'mod:vinyl-disc:disc': { name: '黑胶唱片', host: '黑胶唱机：封面作碟心，唱片旋转、唱臂落下，歌词在唱片旁边排布' },
   'mod:wave-light:wave-light': { name: '动感波光', host: '随封面主色呼吸的波光：左右各有一组同心圆波纹像喇叭声波一样放大缩小、缓缓转动' },
-  'mod:visualizer52hz:52hz': { name: '52Hz', host: 'PixiJS 动画：整句出现后逐字点亮，每个节拍从字形轮廓外发出一圈年轮，响度决定粗细与亮度' },
-  'mod:emofx:emofx': { name: '情绪调音', host: '按歌曲频段判定情绪并实时演出 EQ 曲线（主要是音频效果，歌词画面普通）' },
+  'mod:visualizer52hz:rings': { name: '52Hz', host: 'PixiJS 动画：整句出现后逐字点亮，每个节拍从字形轮廓外发出一圈年轮，响度决定粗细与亮度' },
 };
+
+/* 委托型第三方动画：它们自己不画，只是把画面转交给别的模式（例如「随机」每首歌随机挑一个）。
+ * 让 AI 选中它们等于放弃控制权——本模组要按段决定画面，所以从候选清单里剔除。 */
+const DELEGATING_MODES = new Set([
+  'mod:lyric-style-switcher:random-lyric-style',
+]);
+
+/** 这个模式是不是“委托型”（不该交给 AI 选）。 */
+const isDelegatingMode = (id) => DELEGATING_MODES.has(String(id ?? ''));
 
 /* 第三方动画在注册表里的 mode 可能因模组版本不同而带不同前缀，
  * 这里按“末段 id”再兜一层：cinerama-screen / jump-course 等也能对上画像。 */
@@ -620,15 +629,18 @@ const requestCompletion = async ({ baseUrl, apiKey, model, temperature, system, 
   if (!url) throw new Error('还没有选择服务商或填写接口地址');
   if (!model) throw new Error('还没有填写模型名');
   const base = { model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature, stream: false };
-  const attempts = [{ ...base, response_format: { type: 'json_object' } }, { ...base }];
   let lastError = null;
-  for (let i = 0; i < attempts.length; i += 1) {
+  /* 最多两次：第一次请求 JSON 模式（服务商支持时更稳）；如果被拒或出错，
+   * 第二次去掉 response_format 再试一次（兼容不支持该参数的服务商）。
+   * 限流/服务端错误时先退避再重试，避免连续打同一堵墙。 */
+  for (let i = 0; i < 2; i += 1) {
+    const payload = i === 0 ? { ...base, response_format: { type: 'json_object' } } : { ...base };
     let response;
     try {
       response = await netFetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
-        body: JSON.stringify(attempts[i]),
+        body: JSON.stringify(payload),
         timeoutMs: 45000,
       });
     } catch (error) {
@@ -642,9 +654,20 @@ const requestCompletion = async ({ baseUrl, apiKey, model, temperature, system, 
       throw new Error('接口返回了空内容');
     }
     const errorText = (() => { try { return redact(response.text(), apiKey); } catch { return ''; } })();
-    const retryable = i === 0 && response.status >= 400 && response.status < 500 && ![401, 403, 404, 429].includes(response.status);
     lastError = new Error(`接口返回 ${response.status}：${errorText.slice(0, 240) || response.statusText}`);
-    if (!retryable) throw lastError;
+    const st = response.status;
+    /* 还值得再试一次吗：
+     * - 401/403：密钥或权限问题，重试无用；
+     * - 404：地址写错了，重试无用；
+     * - 其余 4xx：常见原因是服务商不认 response_format，第二次去掉它再试；
+     * - 429 限流 / 5xx 服务端故障：退避后重试是标准做法。 */
+    const worthRetry = st === 429 || st >= 500 || (st >= 400 && st < 500 && ![401, 403, 404].includes(st));
+    if (i === 0 && worthRetry) {
+      const waitMs = st === 429 ? 1200 : st >= 500 ? 800 : 0;
+      if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+      continue;
+    }
+    throw lastError;
   }
   throw lastError ?? new Error('请求失败');
 };
@@ -713,6 +736,10 @@ const createHostAdapter = (folium) => {
     })
     .filter((m) => m.id);
 
+  /* 只给 id，不算 label：缓存指纹只需要“有哪些模式”，
+   * 走 listModes() 会白白做一遍 profileOf 查表和对象映射。 */
+  const listModeIds = () => registryEntries().map((e) => modeIdOf(e)).filter(Boolean).sort();
+
   /* 预加载：Folia 的每个 visualizer 都可以有 prewarm()，宿主自己也会在空闲时调用它。
    * 在切过去之前先调一次，让它把 shader / 纹理 / 排版准备好，切过去时就是无缝的。
    * 返回是否真的调到了。 */
@@ -780,7 +807,11 @@ const createHostAdapter = (folium) => {
     if (typeof state?.handleSetVisualizerMode !== 'function') throw new Error('宿主没有提供切换模式的接口');
     if (state.visualizerMode === mode) return false;
     markOwnWrite();
-    state.handleSetVisualizerMode(mode, { notify: false });
+    /* preserveRandom: true 很重要（Folia 0.7.26+）：
+     * 宿主这个接口默认会把「每首歌随机动画」关掉，用来尊重用户手动选的模式。
+     * 但我们是自动切段，不该顺手改掉用户的随机设置，所以显式保留。
+     * 旧版本没有 preserveRandom 参数，多传一个字段是无害的。 */
+    state.handleSetVisualizerMode(mode, { notify: false, preserveRandom: true });
     return true;
   };
 
@@ -833,7 +864,14 @@ const createHostAdapter = (folium) => {
       for (const key of Object.keys(MODE_PARAMS[mode].params)) if (key in tuning) keep[key] = tuning[key];
       if (Object.keys(keep).length > 0) tunings[mode] = keep;
     }
-    return { mode: state.visualizerMode, tunings };
+    /* 强度和背景也一起存：它们原先只放在内存变量里，模组重载/重启后就丢了，
+     * 于是「恢复原来的设置」只能还原模式和参数，强度和背景永远回不去。 */
+    return {
+      mode: state.visualizerMode,
+      tunings,
+      intensity: readIntensity(),
+      background: readBackground(),
+    };
   };
 
   const restore = (saved) => {
@@ -890,7 +928,7 @@ const createHostAdapter = (folium) => {
   };
 
   return {
-    available, listModes, resolveMode, currentMode, readTuning, setMode, setParams, setClean, snapshot, restore,
+    available, listModes, listModeIds, resolveMode, currentMode, readTuning, setMode, setParams, setClean, snapshot, restore,
     readIntensity, setIntensity,
     BG_MODES, BG_MODES_FOR_AI, BG_LABELS, readBackground, setBackground,
     prewarmMode,
@@ -921,7 +959,9 @@ const PLAN_SYSTEM = [
   '规则：',
   '1. 分段要贴合歌曲结构：主歌、副歌、桥段、结尾可以各自成段；情绪或能量明显变化处应该切开。',
   '2. 相邻两段尽量用不同的模式，让整首歌有层次；但不要为了换而换，安静或过渡的段落可以延续上一段的模式。',
-  '3. mode 必须精确等于清单里的某个 id。',
+  '2b. 清单里标了「第三方，额外安装」的模式是用户自己装的扩展动画：只要清单里有，就应该积极使用它们，',
+  '    不要整首都只用内置模式。第三方模式和内置模式交替会让画面更有变化。',
+  '3. mode 必须精确等于清单里的某个 id（第三方模式的 id 形如 mod:模组名:动画名，必须整串照抄，不要改写或省略前缀）。',
   '4. params 只放“你选的这个模式”的参数，键名与范围必须来自清单；只给 2~5 个你确信能贴合这段歌词的参数。形如 key(…)[需 X=Y] 的参数要连开关一起写进 params。',
   '5. from/to 是歌词行的 0-based 下标（含两端），所有段必须无缝覆盖 0..N-1，不能重叠、不能留空。',
   '6. 每段给一句不超过 30 字的中文 reason。',
@@ -943,8 +983,15 @@ const PLAN_SYSTEM = [
   '{ "segments": [ { "from": 0, "to": 2, "mode": "模式id", "params": { "键": 值 }, "intensity": "calm|normal|chaotic", "bg": "common|monet|nomand|latent|sora", "reason": "为什么这段用这个模式" }, ... ] }',
 ].join('\n');
 
-const buildPlanUser = ({ title, artist, lines, modes, hardLimit }) => {
+const buildPlanUser = ({ title, artist, lines, modes, hardLimit, userHint }) => {
   const rows = [`歌名：${title || '(未知)'}`, `歌手：${artist || '(未知)'}`];
+  // 用户的偏好提示（设置里填的）：放在最前面，比段长约束更优先被注意到
+  const hint = String(userHint ?? '').trim();
+  if (hint) {
+    rows.push('');
+    rows.push(`【用户偏好】${hint}`);
+    rows.push('以上是用户对整首歌画面的要求，在满足歌词内容的前提下优先遵从；但它不能推翻「规则」里的硬性约束。');
+  }
   rows.push(hardLimit
     ? '段长约束（硬限制已开启）：每段 2~4 句。'
     : '段长约束：每段长度由你按歌曲结构决定（1 句到整首都行）。');
@@ -957,20 +1004,33 @@ const buildPlanUser = ({ title, artist, lines, modes, hardLimit }) => {
   for (const mode of modes) {
     const profile = profileOf(mode.id);
     const spec = paramSpecLine(mode.id);
-    // 第三方动画可能没有画像：给一句中性描述，至少让 AI 知道它是“一个可用的第三方画面”
-    const host = profile?.host
-      ?? (isThirdParty(mode.id) ? '第三方模组提供的歌词动画（画面形态未知，但可正常播放）' : mode.label);
-    const tag = isThirdParty(mode.id) ? '（第三方）' : '';
+    const third = isThirdParty(mode.id);
+    // 第三方动画：能对上画像就写画面描述；对不上也要说清它是“额外的”动画，
+    // 否则 AI 会把陌生的 id 当成不可靠选项而绕开。
+    let host;
+    if (profile?.host) host = profile.host;
+    else if (third) host = '额外安装的动画（本模组还没记录它的画面形态，但它能正常播放）';
+    else host = mode.label;
+    const tag = third ? '（第三方，额外安装）' : '';
     rows.push(`- ${mode.id}（${profile?.name ?? mode.label}）${tag}：${host}${spec ? `；可调参数：${spec}` : '；无参数'}`);
   }
-  // 鼓励使用第三方动画：否则模型倾向反复选自己熟悉的那几个内置模式
+  // 明确点出第三方动画存在，并说明来源：模型倾向只选自己熟悉的内置模式
   const thirdParty = modes.filter((m) => isThirdParty(m.id));
   if (thirdParty.length > 0) {
+    const names = thirdParty.map((m) => profileOf(m.id)?.name ?? m.label ?? m.id);
     rows.push('');
-    rows.push(`注意：清单里有 ${thirdParty.length} 个带「（第三方）」标记的模式，它们是这个播放器额外安装的动画，`
-      + '观感通常比内置模式更有辨识度。除非某个内置模式明显更贴合这段，否则请优先考虑第三方模式，'
-      + '让整首歌的画面更有变化，不要反复只用内置的那几个。');
+    rows.push(`这个播放器额外装了 ${thirdParty.length} 个第三方歌词动画：${names.join('、')}（清单里带「第三方，额外安装」标记的那些）。`);
+    rows.push('它们是用户自己安装的扩展动画，观感通常比内置模式更有辨识度，也更不容易和别的歌撞画面。');
+    rows.push('选模式时请把它们当作优先候选：除非某个内置模式明显更贴合这一段，否则优先用第三方；');
+    rows.push('同一首歌里尽量让第三方和内置交替出现，不要整首只用一个、也不要只挑熟悉的那几个内置模式。');
   }
+  // B2+：k3panel 给「商籁」注册了另一套深调系数（cameraScale / motionScale / breathScale …），
+  // 那套走宿主的 modTunings，不经 handleSetSonnetTuning，本模组写不进去也不该写。
+  // 这里明确告诉 AI：只调清单里列出的那些参数，不要自己编键名。
+  rows.push('');
+  rows.push('关于参数：params 的键名只能取上面每个模式「可调参数」里列出的那些，不要自己发明键名。'
+    + '如果某个模式另外装了给它加旋钮的模组（例如给「商籁」加深度精调的 K3Panel），那些旋钮归用户自己调，'
+    + '不属于本模组能写入的范围，请不要试图在 params 里设置它们。');
   rows.push('', '请输出分段剧本 JSON。');
   return rows.join('\n');
 };
@@ -987,12 +1047,19 @@ const enforceHardLimit = (segments) => {
       from = to + 1;
     }
   }
+  /* 单句段（多半是硬限制切分时的余数）合并到前一段，避免过于零碎。
+   * 但只在“配置相同”时才合并——否则会把两个不同模式的段强行并成一段，
+   * 等于篡改 AI 的设计（曾把单句的副歌并进主歌段，画面直接错掉）。 */
   const merged = [];
   for (const s of out) {
     const len = s.to - s.from + 1;
     if (len < 2 && merged.length) {
       const prev = merged[merged.length - 1];
-      if (prev.to + 1 === s.from && (prev.to - prev.from + 1) + len <= 4) {
+      if (prev.to + 1 === s.from
+        && (prev.to - prev.from + 1) + len <= 4
+        && prev.mode === s.mode
+        && (prev.intensity ?? null) === (s.intensity ?? null)
+        && (prev.bg ?? null) === (s.bg ?? null)) {
         prev.to = s.to;
         continue;
       }
@@ -1052,7 +1119,32 @@ const finalizeSegments = (raw, N, hardLimit) => {
       reason: '',
     });
   }
-  const segments = hardLimit ? enforceHardLimit(out) : out;
+  /* 合并“拆开了但配置完全一样”的相邻段。
+   * AI 有时会把一段拆成两段却给出同样的模式/参数/强度/背景（比如第 1–4 句和第 5 句都是「静止」），
+   * 这样每段之间多一次切换开销，画面却没有任何变化——合并掉更干净。
+   * 必须在 enforceHardLimit 之前做：否则刚被切成 4 句一段，又会被合并回去，来回打架。 */
+  const sameConfig = (a, b) => {
+    if (a.mode !== b.mode) return false;
+    if ((a.intensity ?? null) !== (b.intensity ?? null)) return false;
+    if ((a.bg ?? null) !== (b.bg ?? null)) return false;
+    const pa = a.params ?? {};
+    const pb = b.params ?? {};
+    const ka = Object.keys(pa);
+    if (ka.length !== Object.keys(pb).length) return false;
+    return ka.every((k) => pa[k] === pb[k]);
+  };
+  const coalesced = [];
+  for (const s of out) {
+    const prev = coalesced[coalesced.length - 1];
+    if (prev && prev.to + 1 === s.from && sameConfig(prev, s)) {
+      // 保留前一段的 reason（更可能是这一整段的主因），范围延伸到当前段末尾
+      prev.to = s.to;
+      continue;
+    }
+    coalesced.push({ ...s });
+  }
+
+  const segments = hardLimit ? enforceHardLimit(coalesced) : coalesced;
   // 最终连续性保险
   let pos = 0;
   const final = [];
@@ -1078,7 +1170,7 @@ const finalizeSegments = (raw, N, hardLimit) => {
 };
 
 // ============================================================ director 主体
-const createDirector = ({ folium, host, settings, onChange }) => {
+const createDirector = ({ folium, host, settings, onChange, hostAudit = null }) => {
   const log = folium.log;
   let generation = 0;
   let disposed = false;
@@ -1111,9 +1203,12 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     return h;
   };
   const PLAN_PROMPT_HASH = hashOf(PLAN_SYSTEM);
+  /* 只取 id 算指纹：listModes() 会顺带算出 label（profileOf 查表 + 对象映射），
+   * 每次读写缓存都跑一遍没必要。指纹只关心“有哪些模式”。 */
+  const modeIds = () => host.listModeIds();
   let fpsCache = { key: '', value: '' };
   const planFingerprint = () => {
-    const ids = host.listModes().map((m) => m.id).sort().join(',');
+    const ids = modeIds().join(',');
     const hardLimit = settings().hardLimit ? 1 : 0;
     const applyParams = settings().applyParams ? 1 : 0;
     // B1：同一份输入不要重复算哈希（模式列表 + 两个开关决定了结果）
@@ -1133,15 +1228,21 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     return plansIndex.keys;
   };
 
-  /* 从索引里移掉若干条并删除它们的数据（LRU：索引头是最近用的，尾部最旧）。 */
+  /* 删掉一批 key 的数据和索引记录（LRU 用：索引头是最近用的，尾部最旧）。 */
+  const dropPlanKeys = async (keys, drop) => {
+    if (drop.length === 0) return;
+    await Promise.all(drop.map((k) => folium.storage.delete(`plan:${k}`).catch(() => {})));
+    for (const k of drop) prepared.delete(k);
+    await folium.storage.set('plansIndex', keys).catch(() => {});
+  };
+
+  /* 从索引尾部删 count 条（淘汰最旧的）。 */
   const dropPlans = async (count) => {
     const keys = await loadPlansIndex();
     if (count <= 0 || keys.length === 0) return 0;
     const drop = keys.splice(Math.max(0, keys.length - count));
     if (drop.length === 0) return 0;
-    await Promise.all(drop.map((k) => folium.storage.delete(`plan:${k}`).catch(() => {})));
-    for (const k of drop) prepared?.delete(k);
-    await folium.storage.set('plansIndex', keys).catch(() => {});
+    await dropPlanKeys(keys, drop);
     return drop.length;
   };
 
@@ -1151,12 +1252,7 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     const at = keys.indexOf(key);
     if (at !== -1) keys.splice(at, 1);
     keys.unshift(key);
-    const evicted = keys.splice(MAX_PLANS);
-    if (evicted.length > 0) {
-      await Promise.all(evicted.map((k) => folium.storage.delete(`plan:${k}`).catch(() => {})));
-      for (const k of evicted) prepared?.delete(k);
-    }
-    await folium.storage.set('plansIndex', keys).catch(() => {});
+    await dropPlanKeys(keys, keys.splice(MAX_PLANS));
   };
 
   /* 缓存只存分段（每段是行号 + 模式 + 参数），不再存歌词：
@@ -1175,25 +1271,30 @@ const createDirector = ({ folium, host, settings, onChange }) => {
 
   /* 一次性清理：旧版缓存存了整首歌词（每首 36KB），15 首就把 1MB 塞满。
    * 这些数据新版用不上（版本指纹也变了），直接删掉腾出空间。
-   * 只删带 lines 字段的旧条目，不会碰到新格式（新格式没有 lines）。 */
+   * 只删带 lines 字段的旧条目，不会碰到新格式（新格式没有 lines）。
+   * 并行读取：缓存可能有几百条，串行读会在启动时卡住主线程。
+   * A4：清理完写一个标记，以后启动不再全表扫描（几百条读一次也不便宜）。 */
+  const PURGE_FLAG = 'legacyPurged:v1';
   const purgeLegacyPlans = async () => {
     try {
+      if (await folium.storage.get(PURGE_FLAG)) return;
       const keys = await loadPlansIndex();
-      let removed = 0;
-      for (const k of [...keys]) {
-        const v = await folium.storage.get(`plan:${k}`).catch(() => null);
-        if (v && Array.isArray(v.lines)) {
-          await folium.storage.delete(`plan:${k}`).catch(() => {});
-          const at = keys.indexOf(k);
-          if (at !== -1) keys.splice(at, 1);
-          prepared.delete(k);
-          removed += 1;
-        }
+      if (keys.length === 0) {
+        await folium.storage.set(PURGE_FLAG, true).catch(() => {});
+        return;
       }
-      if (removed > 0) {
-        await folium.storage.set('plansIndex', keys).catch(() => {});
-        log.info('已清理旧格式缓存（含歌词的条目）', { removed });
+      const entries = await Promise.all(
+        keys.map((k) => folium.storage.get(`plan:${k}`).catch(() => null).then((v) => [k, v])),
+      );
+      const legacy = entries.filter(([, v]) => v && Array.isArray(v.lines)).map(([k]) => k);
+      if (legacy.length > 0) {
+        await Promise.all(legacy.map((k) => folium.storage.delete(`plan:${k}`).catch(() => {})));
+        const kept = keys.filter((k) => !legacy.includes(k));
+        await folium.storage.set('plansIndex', kept).catch(() => {});
+        for (const k of legacy) prepared.delete(k);
+        log.info('已清理旧格式缓存（含歌词的条目）', { removed: legacy.length });
       }
+      await folium.storage.set(PURGE_FLAG, true).catch(() => {});
     } catch (e) {
       log.warn('清理旧缓存失败', { message: String(e?.message ?? e) });
     }
@@ -1273,38 +1374,47 @@ const createDirector = ({ folium, host, settings, onChange }) => {
   };
 
   // ---- 排演（一次 AI 调用）
-  /* 预热剧本里要用到的模式。
-   * 顺序很重要：**第一段的模式必须第一个热**，因为切歌瞬间就要用它；
-   * 其余模式再慢慢排队，抢占主线程的风险最小。
-   * opts.firstNow：第一段立刻预热（新歌刚进来时用），其余走空闲回调。
-   * opts.skipMode：明确跳过这个模式（通常是“刚设成目标的那个”）。
-   *   不读 host.currentMode() 是因为宿主更新可能滞后，会让我们重复预热同一模式。 */
-  const schedulePrewarm = (plan, { firstNow = false, skipMode = null } = {}) => {
-    const cur = skipMode ?? host.currentMode();
-    const ids = [];
-    for (const s of plan?.segments ?? []) {
-      if (s.mode && s.mode !== cur && !ids.includes(s.mode)) ids.push(s.mode);
+  /* 预热记录：一首歌之内，热过的模式不再重复热。换歌时清空。
+   * Folia 只暴露了 prewarm()，没有卸载接口，所以“热完删掉”做不到；
+   * 能做的是“用不到就不热”——由 tick 按时间窗口决定预热谁。 */
+  const warmedModes = new Set();
+  const resetWarmed = () => warmedModes.clear();
+
+  /* 预热单个模式（幂等：热过的直接跳过）。
+   * 注意：host.prewarmMode() 内部是 try/catch 吞异常的，失败也可能不抛错，
+   * 所以这里不能“调用成功就当热好了”。先记下来，过一会儿再确认它是否真的可用；
+   * 确认不了也不清（宁可少热一次，也不要陷入反复预热的开销）。 */
+  const prewarmOnce = (mode) => {
+    if (!mode || disposed) return false;
+    if (warmedModes.has(mode)) return false;
+    // 当前正在显示的那个不需要预热：它本来就是热的
+    if (host.currentMode() === mode) return false;
+    warmedModes.add(mode);
+    let ok = false;
+    try {
+      ok = host.prewarmMode(mode);
+    } catch (e) {
+      ok = false;
     }
-    if (ids.length === 0) return;
-    const runOne = () => {
-      const mode = ids.shift();
-      if (!mode || disposed) return;
-      host.prewarmMode(mode);
-      if (ids.length > 0) scheduleNext();
-    };
-    const scheduleNext = () => {
-      const idle = globalThis.requestIdleCallback;
-      if (typeof idle === 'function') idle(runOne, { timeout: 2500 });
-      else setTimeout(runOne, 900);
-    };
-    if (firstNow) {
-      // 第一段的模式优先热：它决定了切歌后第一个画面能不能马上出来。
-      // 放到下一帧再执行，避免和“刚切完歌”这一帧抢主线程导致卡顿。
-      requestAnimationFrame(() => runOne());
-      if (ids.length > 0) scheduleNext();
-    } else {
-      scheduleNext();
-    }
+    // prewarmMode 返回 false 表示这个模式没有 prewarm 方法（不是所有视觉器都实现），
+    // 那种情况就当作“不需要预热”，别留着记录让它以后反复尝试。
+    if (!ok) warmedModes.delete(mode);
+    return ok;
+  };
+
+  /* 只热「第一段」：切歌后第一个画面靠它，必须立刻。
+   * 其余模式不再一次性排队预热（会白白占资源，还可能拖慢刚切完的这一帧），
+   * 交给 tick 在“下一段即将到来”时提前热。 */
+  const prewarmFirst = (plan) => {
+    const first = plan?.segments?.[0]?.mode ?? null;
+    if (!first) return;
+    const gen = generation;
+    // 下一帧再热，避免和“刚切完歌”这一帧抢主线程。
+    // 但要检查 generation：这一帧内可能又换歌了，那时预热的是上一首的模式，纯浪费。
+    requestAnimationFrame(() => {
+      if (disposed || gen !== generation) return;
+      prewarmOnce(first);
+    });
   };
 
   /* 核心：给任意一首歌（含歌词）排一份剧本，不碰 current、不动画面。
@@ -1320,7 +1430,8 @@ const createDirector = ({ folium, host, settings, onChange }) => {
 
     const lines = cleanLines(rawLines);
     if (lines.length === 0) throw new Error('这首歌没有歌词，无法逐段排演');
-    const modes = host.listModes();
+    // 委托型模式（例如「随机」）不进候选：本模组要按段决定画面，选它等于放弃控制。
+    const modes = host.listModes().filter((m) => !isDelegatingMode(m.id));
     if (modes.length === 0) throw new Error('没有可用的歌词动画模式');
 
     const raw = await requestCompletion({
@@ -1332,6 +1443,8 @@ const createDirector = ({ folium, host, settings, onChange }) => {
       user: buildPlanUser({
         title: song.title, artist: song.artist, lines, modes,
         hardLimit: hardLimit ?? values.hardLimit,
+        // 用户偏好提示：设置里填了就会随请求发出去（之前收了却没用上）
+        userHint: values.userHint,
       }),
     });
 
@@ -1340,22 +1453,36 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     const segments = finalizeSegments(parsed?.segments, lines.length, hardLimit ?? values.hardLimit);
     if (!segments) throw new Error('AI 返回的分段剧本无效');
 
+    /* 解析 AI 给的 mode。找不到就回退到第一个可用模式，但要记下是哪几段回退了：
+     * 之前是静默回退，表现为“AI 选错了动画”，实际是 id 没解析上（多为第三方动画 id 有歧义）。 */
+    const fallbackMode = modes[0]?.id ?? 'still';
+    const unresolved = [];
+    const outSegments = segments.map((s) => {
+      const resolved = host.resolveMode(s.mode, modes);
+      const mode = resolved ?? fallbackMode;
+      if (!resolved && s.mode) unresolved.push(String(s.mode));
+      const intensity = ['calm', 'normal', 'chaotic'].includes(s.intensity) ? s.intensity : 'normal';
+      const bg = host.BG_MODES_FOR_AI.includes(s.bg) ? s.bg : null;
+      // C1：预存这一段的起止时间，tick 里就不用每帧再去 lines 里查
+      return {
+        from: s.from, to: s.to, mode,
+        params: sanitizeParams(mode, s.params), intensity, bg,
+        start: Number(lines[s.from]?.startTime) || 0,
+        end: Number(lines[s.to]?.endTime) || 0,
+        reason: String(s.reason ?? '').slice(0, 30),
+      };
+    });
+    if (unresolved.length > 0) {
+      const uniq = [...new Set(unresolved)];
+      log.warn('部分模式 id 没解析上，已回退到第一个可用模式', { unmatched: uniq, fallback: fallbackMode });
+    }
+
     return {
       key,
       lines,
-      segments: segments.map((s) => {
-        const mode = host.resolveMode(s.mode, modes) ?? (modes[0]?.id ?? 'still');
-        const intensity = ['calm', 'normal', 'chaotic'].includes(s.intensity) ? s.intensity : 'normal';
-        const bg = host.BG_MODES_FOR_AI.includes(s.bg) ? s.bg : null;
-        // C1：预存这一段的起止时间，tick 里就不用每帧再去 lines 里查
-        return {
-          from: s.from, to: s.to, mode,
-          params: sanitizeParams(mode, s.params), intensity, bg,
-          start: Number(lines[s.from]?.startTime) || 0,
-          end: Number(lines[s.to]?.endTime) || 0,
-          reason: String(s.reason ?? '').slice(0, 30),
-        };
-      }),
+      segments: outSegments,
+      // 记下没解析上的模式 id：面板会提示，方便判断是 AI 写错还是注册表变了
+      unresolvedModes: [...new Set(unresolved)],
       // 记歌词行数：压缩后缓存里没有歌词，靠它校验“这首歌的歌词是否换过源”
       n: lines.length,
       at: Date.now(),
@@ -1377,7 +1504,7 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     target.appliedSeg = -1;
     // 排演完成后立刻热第一段（切歌后第一个画面靠它），其余模式再慢慢排队预热。
     // 这样切过去时是热的，浮名这类排版慢的模式不用临时现排。
-    schedulePrewarm(plan, { firstNow: true });
+    prewarmFirst(plan);
     return plan;
   };
 
@@ -1429,8 +1556,8 @@ const createDirector = ({ folium, host, settings, onChange }) => {
   let prefetchTimer = 0;       // 超时保护
   const PREFETCH_TIMEOUT_MS = 20000;
   const PREFETCH_DELAY_MS = 2000;   // 排演完等 2 秒再准备：够区分“刚开就切走”，又不至于等太久
-  /* 已提前准备好的“下一首”：{ key, mode }。
-   * 有了它，切歌瞬间就能直接切到第一段的模式，不用等读缓存 / 拿歌词。 */
+  /* 已提前准备好的“下一首”：{ key, seg }，seg 是第一段的完整配置（模式/参数/强度/背景）。
+   * 有了它，切歌瞬间就能一次应用完，不用等读缓存 / 拿歌词。 */
   let nextReady = null;
 
   /* 当前这首歌排演完成后，为下一首准备剧本并写缓存。
@@ -1448,16 +1575,27 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     const key = songKeyOf(next);
     if (!key) { lastPrefetchNote = '下一首没有可用的歌曲标识'; return; }
     if (key === current?.key) { lastPrefetchNote = '队列的下一首就是当前这首'; return; }
-    // A1：prepared 只代表“曾经准备过”。缓存可能已被淘汰、或版本变更失效，
-    // 这时必须允许重新准备——命中 prepared 时还要确认缓存仍然有效。
-    // 这里不传歌词：只判断“有没有可用缓存”，不需要 start/end。
+    // A1：prepared 只代表“曾经准备过”。缓存可能已被淘汰、版本变更失效，
+    // 也可能这首歌的歌词换过源（行数变了，旧分段行号不可信）——这些都要允许重做。
+    // B4：所以这里不只看“有没有缓存”，还要用歌词校验行数；歌词是后面本来也要拿的。
     if (prepared.has(key)) {
-      if (await getPlan(key)) return;    // 缓存还在且版本正确 → 真的不用再准备
-      prepared.delete(key);              // 缓存没了/过期了 → 允许重做
+      const cachedNoLines = await getPlan(key);
+      if (cachedNoLines) {
+        // 有缓存：用真实歌词核对一次行数，对不上就作废重排
+        const probe = await lyricsFor(next, key, generation, { waitForEvent: false }).catch(() => null);
+        if (probe && probe.length > 0) {
+          const valid = await getPlan(key, probe);
+          if (valid) { lastPrefetchNote = '下一首已有可用剧本，无需准备'; return; }
+          prepared.delete(key);          // 行数不匹配 → 允许重做
+        } else {
+          // 拿不到歌词就无法校验；保守起见当作有效，别为此白跑一次 AI
+          lastPrefetchNote = '下一首已有可用剧本，无需准备';
+          return;
+        }
+      } else {
+        prepared.delete(key);
+      }
     }
-    // 已经有**当前版本**的缓存就不用再问
-    if (await getPlan(key)) { prepared.add(key); lastPrefetchNote = '下一首已有可用剧本，无需准备'; return; }
-
     // 先占位再等待：否则延迟期间切歌会重入，重复发起请求
     prepared.add(key);
     prefetching = key;
@@ -1467,7 +1605,7 @@ const createDirector = ({ folium, host, settings, onChange }) => {
       if (disposed) return;
       // 延迟期间可能已经切到这首了（那就不叫“提前”了）
       if (current?.key === key) return;
-      if (await getPlan(key)) { succeeded = true; return; }
+      // 缓存是否有效留到拿到歌词后再判（需要行数校验），这里不再用无歌词的 getPlan 短路
       lastPrefetchNote = `正在为「${next.title ?? '下一首'}」排演…`;
       emit();
 
@@ -1482,16 +1620,28 @@ const createDirector = ({ folium, host, settings, onChange }) => {
         lastPrefetchNote = '下一首没有歌词，跳过提前准备';
         return;
       }
+      // A2：这期间可能已经换过歌（generation 变了），那这批歌词就不可信了。
+      // 提前准备是后台任务，换歌后继续写缓存没有意义，直接放弃。
+      if (gen !== generation) {
+        lastPrefetchNote = '已切歌，本次提前准备作废';
+        return;
+      }
+      // B4：拿到歌词后用歌词校验缓存（行数不一致→旧剧本作废）。上面那次检查没法传歌词。
+      if (await getPlan(key, lines)) {
+        succeeded = true;
+        lastPrefetchNote = '下一首已有可用剧本，无需准备';
+        return;
+      }
       if (await hasPlanRaw(key)) { succeeded = true; return; }   // 期间别的路径写好了
       const plan = await buildPlanFor({ song: next, key, lines, hardLimit: settings().hardLimit });
-      if (disposed) return;                // 写缓存前再确认一次
+      if (disposed || gen !== generation) return;   // 写缓存前再确认一次（含换歌检查）
       await putPlan(key, plan);
       succeeded = true;
       lastPrefetchNote = `已提前准备好「${next.title ?? '下一首'}」`;
       log.info('已提前为下一首准备好剧本', { title: next.title, segs: plan.segments.length });
       // 提前准备的价值不只是省 AI 调用：顺手把「下一首第一段」的模式也热起来，
       // 这样切过去时第一个画面能立刻出来（真正的无缝衔接）。
-      schedulePrewarm(plan, { firstNow: true });
+      prewarmFirst(plan);
       // 记到内存里：切歌瞬间就能直接把第一段的模式/参数/强度/背景全部应用，
       // 不用等读存储/拿歌词，也不会出现“只换了模式、参数还是上一首”的半套状态。
       nextReady = { key, seg: plan.segments[0] ?? null };
@@ -1631,7 +1781,9 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     if (disposed || !current) return false;   // 已停用 / 还没建立当前歌上下文
     try {
       current.expectedMode = seg.mode;
-      current.expectedUntil = performance.now() + 1500;
+      // 窗口和正常切段保持一致（2.5 秒）：宿主重建慢时 modeChanged 会晚到，
+      // 窗口太短就会被误判成“用户手动换的”，从而停掉整首的自动切换。
+      current.expectedUntil = performance.now() + 2500;
       host.setMode(seg.mode);
       if (settings().applyParams && seg.params && Object.keys(seg.params).length > 0) {
         host.setParams(seg.mode, seg.params);
@@ -1763,16 +1915,8 @@ const createDirector = ({ folium, host, settings, onChange }) => {
       doSwitch();
     }
 
-    // 切完之后，趁当前段还在播放，先把“下一段要用但当前没用的模式”预热掉。
-    // 这才是真正的无缝衔接：等切过去时它已经准备好，不需要靠遮罩硬压。
-    const nextSeg = current.plan?.segments?.[si + 1];
-    if (nextSeg?.mode && nextSeg.mode !== seg.mode) {
-      // 延迟一点，避开当前这段自己的首帧，别和它抢主线程
-      setTimeout(() => {
-        if (disposed || !current) return;
-        host.prewarmMode(nextSeg.mode);
-      }, 600);
-    }
+    // 切完之后不再一次性预热门下一个模式：改由 tick 里的 prewarmUpcoming
+    // 按“20 秒内会用到的”来热，避免过早预热白占资源。
   };
 
   /** 返回 { pos, state }，无歌返回 null。 */
@@ -1784,17 +1928,76 @@ const createDirector = ({ folium, host, settings, onChange }) => {
 
   /* 段边界就在“新段第一句开唱”的那一刻：到点立刻切，不再往后找空隙——
    * 之前等空隙导致歌词早就唱过去了还没切。间隙短时直接切，靠闪黑遮住。 */
+  /* 预判式预热：看「接下来 20 秒内会切换到哪一段」，把它的模式提前热好。
+   * 这样任何时刻只热“马上要用的”，不会一次性占用一堆资源；
+   * 热过的记在 warmedModes 里，不重复热（也没有卸载接口，热了就不管了）。 */
+  let lastPrewarmScanAt = 0;
+  const prewarmUpcoming = (pos, cfg) => {
+    if (!current?.plan) return;
+    const now = performance.now();
+    // 每 1.5 秒扫一次就够，不必每帧都算
+    if (now - lastPrewarmScanAt < 1500) return;
+    lastPrewarmScanAt = now;
+    // 窗口由设置决定（默认 20 秒）：调大更保险，调小更省资源
+    const aheadRaw = Number(cfg?.prewarmAhead);
+    const ahead = Number.isFinite(aheadRaw) && aheadRaw > 0 ? aheadRaw : 20;
+    const segs = current.plan.segments;
+    for (let i = 0; i < segs.length; i += 1) {
+      const seg = segs[i];
+      const start = Number(seg.start);
+      if (!Number.isFinite(start)) continue;
+      // 已经开始或已经过去的段不需要预热
+      if (start < pos) continue;
+      // 超出预判窗口的不用管（更远的以后再说）
+      if (start - pos > ahead) break;
+      if (seg.mode && !warmedModes.has(seg.mode)) prewarmOnce(seg.mode);
+    }
+  };
+
   const tick = () => {
     if (disposed || !current || current.userOverrode || !current.plan) return;
     const pb = playbackNow();
     if (!pb) return;
+    const now = performance.now();
     // 位置在推进就当作在播放：不同版本 state 的取值不完全一致（playing/play/...），
     // 只认 'playing' 会让某些版本永远不切。
     const advancing = Math.abs((pb.pos ?? 0) - (current.lastPos ?? -1)) > 0.02;
     current.lastPos = pb.pos;
-    if (pb.state !== 'playing' && !advancing) return;
-    // 暂停时不切：静止画面上任何过渡都格外刺眼，而且暂停时切段没有意义
-    if (pb.state === 'paused') return;
+    if (pb.state !== 'playing' && !advancing) {
+      /* 位置不动（缓冲/加载中）：把跳播基准清掉。
+       * 否则缓冲恢复后的第一帧会因为“过了很久但位置没对应前进”被判成跳播，
+       * 触发一次多余的强制重切。 */
+      current.jumpBase = null;
+      return;
+    }
+    // 暂停时不切：静止画面上任何过渡都格外刺眼，而且暂停时切段没有意义。
+    // A3：暂停/恢复之间不记跳播基准，否则恢复播放的第一帧会被算成“跳了一大段”。
+    if (pb.state === 'paused') { current.jumpBase = null; return; }
+
+    /* 跳播检测改成“按实际经过时间算预期位移”：
+     * 正常播放时位置应该前进 ≈ 经过秒数；偏离太多才是拖动进度条。
+     * 这样暂停恢复、缓冲卡顿后追上播放位置都不会被误判成跳播。
+     * 没基准（刚换歌/刚恢复暂停）时只建立基准，不判跳播。 */
+    const pos = pb.pos ?? 0;
+    const base = current.jumpBase;
+    let jumped = false;
+    if (!base) {
+      current.jumpBase = { pos, at: now };
+    } else {
+      const dt = (now - base.at) / 1000;
+      const expected = dt;                       // 正常播放应前进的秒数
+      const actual = pos - base.pos;
+      // 偏离 1.5 秒以上才算跳播（缓冲卡顿、解码抖动都远小于这个量级）
+      jumped = Math.abs(actual - expected) > 1.5;
+      current.jumpBase = { pos, at: now };
+    }
+
+    /* 每帧只取一次设置：settings() 会读存储并构造新对象，tick 40ms 一次不宜多调。
+     * 这里提前取，后面预热和提前量计算共用同一份。 */
+    const cfg = settings();
+
+    // 顺手把“即将到来”的模式提前热好（这才是秒切的关键）
+    prewarmUpcoming(pos, cfg);
     const lines = current.plan.lines;
     const li = lineIndexAt(lines, pb.pos);
     const firstStart = Number(lines[0]?.startTime);
@@ -1802,17 +2005,26 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     // 否则换歌后会一直停在上一首的动画上。
     const beforeFirst = li < 0 && (!Number.isFinite(firstStart) || pb.pos < firstStart);
     if (beforeFirst) {
-      if (current.appliedSeg !== 0) applySegment(0, { immediate: true });
+      if (current.appliedSeg !== 0) {
+        // 前奏也要守最小间隔：刚切过又马上再切，会和上一首收尾叠在一起，表现为闪黑。
+        // 唯一例外是“从没切过”（appliedSeg === -1），那时必须立刻切，否则会停在上一首的动画上。
+        const firstTime = current.appliedSeg < 0;
+        const since = performance.now() - (current.segAt ?? 0);
+        if (firstTime || since >= MIN_SWITCH_GAP_MS) {
+          applySegment(0, { immediate: true });
+        }
+      }
       return;
     }
 
     // 按“当前时间 + 提前量”算出应该处于哪一段。
     // 提前量很关键：新段第一句还没开唱就先切好，旧动画就没机会把新句渲染出来
     // （否则会看到“旧动画先闪一句新歌词，再切过去”）。
-    const leadSetting = Number(settings().lead);
+    // 每帧只取一次设置（本函数开头已取）：
+    const leadSetting = Number(cfg.lead);
     const LEAD = Number.isFinite(leadSetting) ? leadSetting : LEAD_SECONDS;
     // 有过渡时，把“压暗 + 最短保持”也算进提前量：这样新句开唱时画面已经亮回来了。
-    const overlayCost = settings().transition ? (FADE_IN_MS + MIN_HOLD_MS) / 1000 : 0;
+    const overlayCost = cfg.transition ? (FADE_IN_MS + MIN_HOLD_MS) / 1000 : 0;
     const totalLead = LEAD + overlayCost;
     const targetSeg = (() => {
       let best = -1;
@@ -1842,20 +2054,48 @@ const createDirector = ({ folium, host, settings, onChange }) => {
       if (best < 0) best = 0;
       return best;
     })();
-    // 跳播（拖进度条 / 跳段）：位置突然跳很远，必须立刻跟上，而且直接切不走过渡。
-    // 先把“上次切换”的记账清掉，否则最小间隔会把这次切换吃掉，表现为“拖了进度条动画不跟着变”。
-    const jumped = Math.abs((pb.pos ?? 0) - (current.prevPosForJump ?? pb.pos)) > 2.5;
-    current.prevPosForJump = pb.pos;
+    // 跳播（拖进度条 / 跳段）：位置与“应该走到的地方”差太多，必须立刻跟上，而且直接切不走过渡。
     if (jumped) {
       // 拖动是连续的，同一段可能被反复判定：已经在这一段了就不要再切一次
       if (targetSeg === current.appliedSeg) return;
-      current.segAt = 0;
+      // 注意：不要在这里把 segAt 设成 0。applySegment 内部会写正确的值，
+      // 提前清零会让后续 tick 误以为“很久没切过”，拖动手感变成每拖一点就重切一次。
+
+      /* 跳播不走遮罩，如果目标是个慢模式（浮名/町景等）且还没预热过，
+       * 直接切过去会明显卡一下。先热一下，给它一点铺场时间再切。
+       * 延迟很短（最多 350ms），用户基本察觉不到，但能避免整段卡死。 */
+      const seg = current.plan.segments[targetSeg];
+      const slow = extraLeadFor(seg.mode) > 0 || Boolean(MODE_COST[seg.mode]?.patch);
+      const notWarm = seg.mode && !warmedModes.has(seg.mode) && host.currentMode() !== seg.mode;
+      if (slow && notWarm) {
+        prewarmOnce(seg.mode);
+        const delay = Math.min(350, Math.round(extraLeadFor(seg.mode) * 1000));
+        // 用独立的待办标记，不要在定时器里检查 appliedSeg：
+        // 上面为了防 tick 重复触发会先把 appliedSeg 设成目标段，那个检查会永远成立。
+        const pending = { seg: targetSeg, gen };
+        current.pendingJump = pending;
+        current.appliedSeg = targetSeg;          // 防止这段延迟里 tick 反复进入跳播分支
+        current.segAt = performance.now();       // 别设 0：否则下一步会过度积极地再切一次
+        setTimeout(() => {
+          if (disposed || !current) return;
+          if (current.pendingJump !== pending) return;   // 被新的跳播顶掉了
+          if (pending.gen !== generation) return;        // 期间换歌了
+          current.pendingJump = null;
+          applySegment(targetSeg, { immediate: true, force: true });
+        }, delay);
+        return;
+      }
+
+      // 直接切换前先取消可能还在等的延迟任务：
+      // 否则那个定时器到点后会把画面抢回它记的旧目标段。
+      current.pendingJump = null;
       // 跳播是外部位置变化：强制重应用，保证画面与段一致
       applySegment(targetSeg, { immediate: true, force: true });
       return;
     }
 
-    if (targetSeg < 0 || targetSeg === current.appliedSeg) return;
+    // targetSeg 恒 >= 0（上面 best<0 时已回落到 0），只判断是否已经在该段
+    if (targetSeg === current.appliedSeg) return;
 
     // 刚切过没多久：这一次先不动画，但不要改 appliedSeg（改了就等于“认账却没切”，之后永远不切）
     const sinceLast = performance.now() - (current.segAt ?? 0);
@@ -1879,13 +2119,15 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     prefetching = null;      // 上一首的提前准备如果卡住了，换歌时释放占位
     clearTimeout(prefetchTimer);
     prefetchTimer = 0;
+    resetWarmed();           // 换歌了：上一首的预热记录作废，新歌重新按需预热
+    lastPrewarmScanAt = 0;
     startTicking();
     if (!song) { current = null; emit(); return; }
     const key = songKeyOf(song);
     current = {
       song, key, startedAt: performance.now(), phase: 'idle', message: '',
       plan: null, appliedSeg: -1, userOverrode: false, expectedMode: null, expectedUntil: 0,
-      segAt: 0, prevPosForJump: null,
+      segAt: 0, jumpBase: null, pendingJump: null,
     };
     // 记下这首歌最开始时的强度/背景，供“恢复原来的设置”还原（每首歌重新记，避免用很久以前的值）
     originalIntensity = host.readIntensity();
@@ -1906,8 +2148,13 @@ const createDirector = ({ folium, host, settings, onChange }) => {
      * 没有提前准备（第一次听这首）就保持旧动画，等排演完再切（这是用户要的行为）。 */
     if (nextReady && nextReady.key === key && nextReady.seg) {
       const seg = nextReady.seg;
-      nextReady = null;
-      if (applySegmentSpec(seg)) log.info('切歌瞬间直接应用已准备好的第一段', { mode: seg.mode });
+      // 先别急着清：应用失败时要把这条预备信息放回去，靠后面的缓存路径兜底
+      if (applySegmentSpec(seg)) {
+        nextReady = null;
+        log.info('切歌瞬间直接应用已准备好的第一段', { mode: seg.mode });
+      } else {
+        log.warn('切歌瞬间应用第一段失败，留给缓存路径处理', { mode: seg.mode });
+      }
     } else if (nextReady && nextReady.key !== key) {
       // 切到了别的歌（比如手动跳歌），这条预备信息就作废了
       nextReady = null;
@@ -1930,12 +2177,13 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     // 先拿歌词：压缩后的缓存只存行号，需要歌词才能还原 start/end。
     // 缓存命中时就能直接套用，不必再等 AI。
     const lines = await lyricsFor(song, key, gen);
-    if (gen !== generation) return;
+    // current 可能在这期间被置空（模组被停用），generation 检查挡不住空值
+    if (gen !== generation || !current) return;
 
     // 命中缓存直接套用（这里必须再读一次 getPlan(key, lines)：要用歌词补 start/end，
     // 上面那次是不带歌词的快速读取，只够判断第一段模式）
     const cached = lines && lines.length > 0 ? await getPlan(key, lines) : null;
-    if (gen !== generation) return;
+    if (gen !== generation || !current) return;
     if (cached?.segments?.length > 0) {
       current.lines = lines;
       current.plan = cached;
@@ -1943,7 +2191,7 @@ const createDirector = ({ folium, host, settings, onChange }) => {
       current.phase = 'ready';
       current.message = '已套用记住的分段剧本';
       // 第一段的模式立刻热（切歌后第一个画面靠它），其余再排队
-      schedulePrewarm(current.plan, { firstNow: true });
+      prewarmFirst(current.plan);
       emit();
       // 已经命中缓存：说明上一首的提前准备生效了。继续为再下一首准备。
       prefetchNextSong().catch(() => {});
@@ -1963,15 +2211,16 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     current.lines = lines;
     try {
       await planSong(current);
-      if (gen !== generation) return;
+      if (gen !== generation || !current) return;
       await putPlan(key, current.plan);
+      if (gen !== generation || !current) return;
       current.phase = 'ready';
       current.message = `已排好 ${current.plan.segments.length} 段，播放时逐段切换`;
       emit();
       // 这首歌排好了，趁它还在播，马上去准备下一首（切过去时 0 延迟）
       prefetchNextSong().catch(() => {});
     } catch (e) {
-      if (gen !== generation) return;
+      if (gen !== generation || !current) return;
       current.phase = ['no-key', 'no-config'].includes(e?.code) ? e.code : 'error';
       current.message = String(e?.message ?? e);
       emit();
@@ -2020,7 +2269,7 @@ const createDirector = ({ folium, host, settings, onChange }) => {
       current.phase = 'ready';
       current.message = `已重新排好 ${current.plan.segments.length} 段，播放时逐段切换`;
       current.appliedSeg = -1;
-      schedulePrewarm(current.plan, { firstNow: true });
+      prewarmFirst(current.plan);
       emit();
       return `已重新排好 ${current.plan.segments.length} 段`;
     } catch (e) {
@@ -2034,6 +2283,13 @@ const createDirector = ({ folium, host, settings, onChange }) => {
   const stopDirecting = async () => {
     if (!current) return '现在没有在播放的歌';
     cancelFade();
+    // 停掉自动切换时也要释放提前准备的占位：
+    // 否则那一轮如果卡住不出结果，之后所有 prefetchNextSong 都会被挡在门外。
+    prefetching = null;
+    prepared.clear();
+    nextReady = null;
+    clearTimeout(prefetchTimer);
+    prefetchTimer = 0;
     current.userOverrode = true;
     current.phase = 'user';
     current.message = '已停止本首的自动切换';
@@ -2046,21 +2302,20 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     cancelFade();
     restoreQualityNow();
     const saved = await folium.storage.get('snapshot');
-    if (!saved && !originalIntensity) return '还没有改动过你的设置';
+    if (!saved && !originalIntensity && !originalBackground) return '还没有改动过你的设置';
     if (saved) {
       host.restore(saved);
       await folium.storage.set('snapshot', null);
     }
-    // 动画强度也还原成模组接管前的值
-    if (originalIntensity) {
-      host.setIntensity(originalIntensity);
-      originalIntensity = null;
-    }
-    // 背景类型同样还原
-    if (originalBackground) {
-      host.setBackground(originalBackground);
-      originalBackground = null;
-    }
+    /* 强度/背景优先用快照里的值：内存变量 originalIntensity 在模组重载后是空的，
+     * 只用它会导致“重启后恢复设置，强度和背景回不去”。 */
+    const wantIntensity = originalIntensity ?? saved?.intensity ?? null;
+    const wantBackground = originalBackground ?? saved?.background ?? null;
+    // C1：必须 flush，否则只写 localStorage 不生效，要等下次切段才应用
+    if (wantIntensity) host.setIntensity(wantIntensity, true);
+    if (wantBackground) host.setBackground(wantBackground);
+    originalIntensity = null;
+    originalBackground = null;
     if (current) current.userOverrode = true;
     return '已恢复原来的模式、参数、动画强度与背景';
   };
@@ -2111,14 +2366,46 @@ const createDirector = ({ folium, host, settings, onChange }) => {
     takeBack,
     beforeApply: ensureSnapshot,
     getState: () => current,
-    /** 当前注册表里的第三方动画（面板用来确认 AI 能选到哪些）。 */
     /** 背景类型的中文名（面板用，避免重复定义一份）。 */
     getBgLabels: () => host.BG_LABELS,
     /** 提前准备的状态提示（为什么没准备、准备成功等），面板用来排查。 */
     getPrefetchNote: () => lastPrefetchNote,
-    listThirdParty: () => host.listModes().filter((m) => isThirdParty(m.id)).map((m) => m.label ?? m.id),
+    /** 当前正在播/已应用的段索引（tick 里算好的，面板直接高亮，不用自己再扫一遍歌词）。 */
+    getActiveSeg: () => (current?.plan ? current.appliedSeg : -1),
+    /** 启动自检结果（缺哪些接口 / 哪些第三方动画没画像），面板常驻显示。 */
+    getHostAudit: () => hostAudit,
+    /* 面板用：所有第三方动画，标出哪些已经有画像（有画像 AI 才知道画面长什么样）。 */
+    listThirdParty: () => host.listModes()
+      .filter((m) => isThirdParty(m.id))
+      .map((m) => {
+        const p = profileOf(m.id);
+        return { id: m.id, name: p?.name ?? m.label ?? m.id, hasProfile: Boolean(p?.host) };
+      }),
     listAllModes: () => host.listModes().map((m) => m.id),
-    dispose: () => { disposed = true; generation += 1; clearInterval(tickTimer); },
+    /* 停用：把所有还在跑的异步任务清干净。
+     * 光设 disposed 不够——定时器和 rAF 还在跑，会继续写已经废弃的状态、甚至往已删除的
+     * 遮罩节点上写 opacity。模组会被反复启用/停用，清理不净就会累积。 */
+    dispose: () => {
+      disposed = true;
+      generation += 1;
+      clearInterval(tickTimer);
+      tickTimer = null;
+      clearTimeout(prefetchTimer);
+      prefetchTimer = 0;
+      clearTimeout(qualityRestoreTimer);
+      qualityRestoreTimer = 0;
+      // 每个被临时降过画质的模式，自己的恢复定时器也要清
+      for (const item of qualitySaved.values()) {
+        if (item?.timer) clearTimeout(item.timer);
+      }
+      qualitySaved.clear();
+      cancelFade();          // 停掉可能还在跑的过渡 rAF
+      prefetching = null;
+      prepared.clear();
+      nextReady = null;
+      warmedModes.clear();
+      current = null;
+    },
   };
 };
 
@@ -2152,6 +2439,12 @@ const mountPanel = (container, _ctx, { director, folium, settings }) => {
   const prefetchLine = document.createElement('div');
   prefetchLine.className = 'muted';
   prefetchLine.style.cssText = 'font-size:11px;opacity:0.55;margin-top:2px;display:none;';
+  // 模式 id 解析失败的提示（平时不显示）
+  const unresolvedLine = document.createElement('div');
+  unresolvedLine.style.cssText = 'font-size:11px;color:#ffb74d;margin-top:2px;display:none;';
+  // 启动自检结果：接口缺失/画像缺失时常驻显示（只在有问题时出现）
+  const auditLine = document.createElement('div');
+  auditLine.style.cssText = 'font-size:11px;color:#ff8a80;margin-top:2px;display:none;white-space:pre-wrap;';
   const list = document.createElement('div');
   const actions = document.createElement('div');
   actions.className = 'row';
@@ -2177,6 +2470,8 @@ const mountPanel = (container, _ctx, { director, folium, settings }) => {
   root.appendChild(status);
   root.appendChild(thirdLine);
   root.appendChild(prefetchLine);
+  root.appendChild(unresolvedLine);
+  root.appendChild(auditLine);
   root.appendChild(actions);
   root.appendChild(takeoverRow);
   root.appendChild(list);
@@ -2184,18 +2479,78 @@ const mountPanel = (container, _ctx, { director, folium, settings }) => {
   container.appendChild(root);
 
   const PHASES = { idle: '空闲', planning: '排演中', ready: '已排好', user: '你已手动接管', 'no-lyrics': '无歌词', 'no-key': '缺少密钥', 'no-config': '还没设置好', 'switch-failed': '切换未生效', error: '出错' };
+  /* 启动自检结果与“当前播哪首歌”无关，单独渲染：
+   * 没在播放时也要能看见（新用户启用后往往还没放歌），只在有问题时占地方。 */
+  const renderAudit = () => {
+    try {
+      const audit = director.getHostAudit?.();
+      const parts = [];
+      if (audit?.missing?.length > 0) {
+        parts.push(`⚠ 当前 Folia ${audit.folia} 缺少 ${audit.missing.length} 个接口：${audit.missing.join('、')}`);
+        parts.push('（模组可能无法正常切换动画，请检查 Folia 版本或等待适配更新）');
+      }
+      if (audit?.noProfile?.length > 0) {
+        parts.push(`⚠ ${audit.noProfile.length} 个第三方动画还没有画面描述，AI 不了解它们：${audit.noProfile.join('、')}`);
+      }
+      const text = parts.join('\n');
+      auditLine.textContent = text;
+      auditLine.style.display = text ? '' : 'none';
+    } catch { auditLine.style.display = 'none'; }
+  };
+
+  /* 面板每 500ms 渲染一次。原来每次都重建整个 <ol> + 重新扫描歌词找当前段，
+   * 这是纯浪费：当前段 tick 里早就用 appliedSeg 记好了，直接用即可。
+   * 改成「剧本变了才重建列表，平时只改高亮」——列表稳定时零 DOM 重排。 */
+  const INTENSITY_ZH = { calm: '平静', normal: '正常', chaotic: '混乱' };
+  let renderedPlanRef = null;   // 上次渲染的剧本对象引用
+  let renderedLiEls = [];       // 对应的 <li> 数组
+  let renderedOl = null;
+
   const render = () => {
     const s = director.getState();
-    if (!s) { title.textContent = '现在没有在播放的歌'; status.textContent = ''; list.textContent = ''; return; }
+    if (!s) {
+      // 没在播放：把上一首歌留下的内容全部清掉，否则面板会残留别的歌的信息
+      title.textContent = '现在没有在播放的歌';
+      status.textContent = '';
+      list.textContent = '';
+      thirdLine.textContent = '';
+      unresolvedLine.style.display = 'none';
+      unresolvedLine.textContent = '';
+      prefetchLine.style.display = 'none';
+      prefetchLine.textContent = '';
+      takeoverRow.style.display = 'none';
+      renderedPlanRef = null;
+      renderedLiEls = [];
+      renderedOl = null;
+      // 自检结果与歌曲无关，这里不清，交给下面的分支刷新
+      renderAudit();
+      return;
+    }
     title.textContent = `${s.song.title ?? '(未知)'}${s.song.artist ? ` — ${s.song.artist}` : ''}`;
     status.textContent = `[${BUILD_TAG}] ${PHASES[s.phase] ?? s.phase}${s.message ? `：${s.message}` : ''}`;
-    // 让用户/我都能一眼确认 AI 的候选里到底有几个第三方动画
+    // 有模式 id 没解析上时提醒：否则表现为“AI 选错了动画”，其实是回退到第一个模式了
+    const unresolved = Array.isArray(s.plan?.unresolvedModes) ? s.plan.unresolvedModes : [];
+    if (unresolved.length > 0) {
+      unresolvedLine.textContent = `⚠ ${unresolved.length} 个模式 id 没解析上，相关段已回退：${unresolved.join('、')}`;
+      unresolvedLine.style.display = '';
+    } else {
+      unresolvedLine.style.display = 'none';
+    }
+    // 让用户/我都能一眼确认 AI 的候选里到底有几个第三方动画，以及哪些还没有画像
     try {
       const thirds = director.listThirdParty();
-      thirdLine.textContent = thirds.length > 0
-        ? `第三方动画 ${thirds.length} 个：${thirds.join('、')}`
-        : '第三方动画：注册表里没发现（只会在内置模式里选）';
+      if (thirds.length === 0) {
+        thirdLine.textContent = '第三方动画：注册表里没发现（只会在内置模式里选）';
+      } else {
+        // 直接列真实 id：画像 key 对不上时，一眼就能看出来（带 ✗ 的就是没有画像的）
+        const names = thirds.map((t) => `${t.hasProfile ? '✓' : '✗'}${t.id}`);
+        const missing = thirds.filter((t) => !t.hasProfile).length;
+        thirdLine.textContent = `第三方动画 ${thirds.length} 个：${names.join('  ')}`
+          + (missing > 0 ? `（${missing} 个✗还没有画面描述）` : '');
+      }
     } catch { thirdLine.textContent = ''; }
+    // 启动自检：只在“有问题”时显示，正常不占地方
+    renderAudit();
     // 提前准备的状态（有才显示）
     try {
       const note = director.getPrefetchNote?.() ?? '';
@@ -2204,17 +2559,31 @@ const mountPanel = (container, _ctx, { director, folium, settings }) => {
     } catch { prefetchLine.style.display = 'none'; }
     // 手动接管后（或停用了自动切换）才显示「AI 接管」
     takeoverRow.style.display = (s.userOverrode && s.plan) ? '' : 'none';
-    const state = folium.playback.getState();
-    let active = -1;
-    if (s.plan && state?.state === 'playing') {
-      let idx = -1;
-      for (let i = 0; i < s.plan.lines.length; i += 1) { if (Number.isFinite(s.plan.lines[i].startTime) && state.position >= s.plan.lines[i].startTime) idx = i; else if (idx >= 0) break; }
-      if (idx >= 0) for (let i = 0; i < s.plan.segments.length; i += 1) if (idx >= s.plan.segments[i].from && idx <= s.plan.segments[i].to) active = i;
+
+    // A3：没剧本就提前清空返回，别在后面白算
+    if (!s.plan || !Array.isArray(s.plan.segments)) {
+      list.textContent = '';
+      renderedPlanRef = null;
+      renderedLiEls = [];
+      renderedOl = null;
+      return;
     }
-    if (!s.plan) { list.textContent = ''; return; }
-    const ol = document.createElement('ol');
-    const INTENSITY_ZH = { calm: '平静', normal: '正常', chaotic: '混乱' };
+
+    // 当前段直接用 director 记好的，不再扫描歌词（A1/A4/B2）
+    const active = director.getActiveSeg?.() ?? -1;
     const bgLabels = director.getBgLabels();
+
+    // A2：剧本对象没变就只改高亮，不重建 DOM
+    if (renderedPlanRef === s.plan && renderedOl) {
+      for (let i = 0; i < renderedLiEls.length; i += 1) {
+        renderedLiEls[i].className = (i === active) ? 'active' : '';
+      }
+      return;
+    }
+
+    // 剧本变了：重建一次列表
+    const ol = document.createElement('ol');
+    const lis = [];
     s.plan.segments.forEach((seg, i) => {
       const li = document.createElement('li');
       const label = profileOf(seg.mode)?.name ?? seg.mode;
@@ -2223,8 +2592,12 @@ const mountPanel = (container, _ctx, { director, folium, settings }) => {
       li.textContent = `第 ${seg.from + 1}–${seg.to + 1} 句 · ${label}${strength}${bg}${seg.reason ? `：${seg.reason}` : ''}`;
       if (i === active) li.className = 'active';
       ol.appendChild(li);
+      lis.push(li);
     });
     list.replaceChildren(ol);
+    renderedPlanRef = s.plan;
+    renderedLiEls = lis;
+    renderedOl = ol;
   };
   const stop = _ctx.every ? _ctx.every(500, render) : null;
   render();
@@ -2237,6 +2610,60 @@ export default async function activate(folium) {
   if ((folium.host?.folium?.minor ?? 0) < 7) {
     folium.ui.toast('AI 逐段歌词导演 需要 Folium 1.7（Folia 0.7.22）或更新版本', { type: 'error' });
     return undefined;
+  }
+
+  /* 宿主升级适配自检：Folia 每次大改都可能动这些内部接口名，
+   * 这里一次性检查本模组依赖的所有入口，缺哪个就在日志里说清楚，
+   * 免得等到切歌时才炸出一堆看不懂的错误。 */
+  const checkHostApi = () => {
+    const missing = [];
+    try {
+      const i = folium.internals;
+      if (!i) return missing.push('internals');
+      if (!i.stores?.visualizerSettings) missing.push('stores.visualizerSettings');
+      if (!i.stores?.themeSettings) missing.push('stores.themeSettings');
+      if (!Array.isArray(i.visualizerRegistry)) missing.push('visualizerRegistry');
+      const vs = i.stores?.visualizerSettings?.getState?.();
+      if (typeof vs?.handleSetVisualizerMode !== 'function') missing.push('handleSetVisualizerMode');
+      if (typeof vs?.handleSetVisualizerBackgroundMode !== 'function') missing.push('handleSetVisualizerBackgroundMode');
+      const ts = i.stores?.themeSettings?.getState?.();
+      if (typeof ts?.setTheme !== 'function') missing.push('themeSettings.setTheme');
+      // 播放与歌词
+      if (typeof folium.playback?.getState !== 'function') missing.push('playback.getState');
+      if (typeof folium.lyrics?.getLines !== 'function') missing.push('lyrics.getLines');
+    } catch (e) {
+      missing.push(`检查出错：${String(e?.message ?? e)}`);
+    }
+    return missing;
+  };
+
+  /* 自检结果不只在日志里：面板会常驻显示。
+   * 否则新用户只在启用那一刻看到一个 toast，之后再也找不到“到底缺什么”。 */
+  const hostAudit = { missing: [], thirdParty: [], noProfile: [], folia: folium.host?.folia ?? '?' };
+  const hostMissing = checkHostApi();
+  hostAudit.missing = hostMissing;
+  if (hostMissing.length > 0) {
+    folium.log.warn('宿主接口缺失，本模组可能无法正常工作', {
+      folia: folium.host?.folia, missing: hostMissing,
+    });
+    folium.ui.toast(`AI 逐段歌词导演：当前 Folia 缺少 ${hostMissing.length} 个接口，功能可能异常（详见日志）`, { type: 'error' });
+  } else {
+    folium.log.info('宿主接口自检通过', { folia: folium.host?.folia, build: BUILD_TAG });
+    // 把实际注册的第三方动画 id 与画像对照一次写进日志：
+    // 对不上说明画像 key 过时了（模组更新后 id 可能变），需要补。
+    try {
+      const list = folium.internals?.visualizerRegistry ?? [];
+      const third = list.map((e) => e.mode ?? e.id ?? '').filter((id) => String(id).startsWith('mod:'));
+      const unmatched = third.filter((id) => !profileOf(id)?.host);
+      hostAudit.thirdParty = third;
+      hostAudit.noProfile = unmatched;
+      folium.log.info(
+        `MODE-AUDIT 第三方动画 ${third.length} 个，没画像的 ${unmatched.length} 个`,
+        { ids: third, unmatched },
+      );
+    } catch (e) {
+      folium.log.warn('MODE-AUDIT 读取注册表失败', { message: String(e?.message ?? e) });
+    }
   }
 
   const PROVIDER_OPTIONS = Object.entries(PROVIDERS).map(([value, p]) => ({ value, label: T(p.label, p.label) }));
@@ -2269,6 +2696,10 @@ export default async function activate(folium) {
     { key: 'lead', type: 'number', group: T('行为', 'Behaviour'), label: T('提前切换（秒）', 'Switch ahead (seconds)'),
       description: T('在新段第一句开唱前多少秒就切过去。调大能减少“旧动画闪出新句”；太大会切早了', 'Switch this long before the segment starts. Larger hides the old scene better; too large switches early'),
       defaultValue: 0.9, min: 0, max: 3, step: 0.1 },
+    { key: 'prewarmAhead', type: 'number', group: T('行为', 'Behaviour'), label: T('预热提前量（秒）', 'Prewarm lookahead (seconds)'),
+      description: T('下一段的动画提前多少秒开始预热。调大更保险但更早占用资源；调小更省但可能来不及',
+        'How early to prewarm the next segment animation. Larger is safer but uses resources sooner'),
+      defaultValue: 20, min: 5, max: 60, step: 5 },
     { key: 'userHint', type: 'text', group: T('行为', 'Behaviour'), label: T('偏好提示（可选）', 'Preference hint'),
       description: T('例如“整体安静一点”“副歌要有爆发感”', 'e.g. "calmer overall"'), defaultValue: '' },
   ];
@@ -2293,6 +2724,7 @@ export default async function activate(folium) {
       hardLimit: v.hardLimit !== false,
       transition: v.transition !== false,
       lead: Number(v.lead ?? 0.9),
+      prewarmAhead: Number(v.prewarmAhead ?? 20),
       userHint: String(v.userHint ?? '').trim().slice(0, 100),
     };
   };
@@ -2302,13 +2734,19 @@ export default async function activate(folium) {
   const director = createDirector({
     folium, host, settings,
     onChange: () => renderers.forEach((r) => r()),
+    hostAudit,
   });
 
-  folium.events.on('playback.songChanged', ({ song }) => director.onSongChanged(song));
-  folium.events.on('lyrics.loaded', ({ song, lines }) => director.onLyricsLoaded(song, lines));
-  folium.events.on('visualizer.modeChanged', ({ mode }) => director.onModeChanged(mode));
-  folium.secrets.subscribe(() => director.onSetupChanged());
-  section.settings.onChange(() => director.onSetupChanged());
+  /* 订阅宿主事件。每个 on/subscribe 都返回取消函数，必须存下来并在停用时全部调用：
+   * 模组会被反复启用/停用，不取消就会叠加监听——一次换歌被处理 N 次，
+   * 表现为重复调 AI、重复切换动画。 */
+  const unsubscribers = [];
+  const keepUnsub = (fn) => { if (typeof fn === 'function') unsubscribers.push(fn); };
+  keepUnsub(folium.events.on('playback.songChanged', ({ song }) => director.onSongChanged(song)));
+  keepUnsub(folium.events.on('lyrics.loaded', ({ song, lines }) => director.onLyricsLoaded(song, lines)));
+  keepUnsub(folium.events.on('visualizer.modeChanged', ({ mode }) => director.onModeChanged(mode)));
+  keepUnsub(folium.secrets.subscribe(() => director.onSetupChanged()));
+  keepUnsub(section.settings.onChange(() => director.onSetupChanged()));
 
   // 闪黑过渡覆盖层挂在 document.body（fixed 全屏），不经过 stageLayers：
   // stageLayers 的容器在 shadow root 内，遮罩会被裁剪/层级不够，等于没有过渡。
@@ -2333,6 +2771,21 @@ export default async function activate(folium) {
 
   // 启用时先清一次：把上一次运行可能留下的残留遮罩（半透明黑层）删干净
   purgeOverlays();
+  /* 启用瞬间如果正在放歌、且开了自动排演，会立刻向 AI 发一次请求（会花钱）。
+   * 先用一句话告知，避免用户以为“只是打开了个面板”。 */
+  try {
+    const { song } = folium.playback.getState();
+    if (song && settings().autoDirect) {
+      folium.ui.toast('逐段导演已启用：正在为当前歌曲向 AI 排演分段剧本（会消耗一次调用）', { type: 'info' });
+    }
+  } catch { /* 拿不到播放状态就不提示 */ }
   director.start().catch((e) => folium.log.warn('启动时处理当前歌曲出错', { message: String(e?.message ?? e) }));
-  return () => { purgeOverlays(); director.dispose(); };
+  return () => {
+    // 先取消订阅，避免停用过程中事件还在往 director 里送
+    for (const un of unsubscribers.splice(0)) {
+      try { un(); } catch { /* 单个取消失败不影响其它 */ }
+    }
+    purgeOverlays();
+    director.dispose();
+  };
 }

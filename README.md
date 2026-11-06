@@ -52,6 +52,40 @@
 
 `folium.secrets`（API 密钥）不需要权限；密钥只发给上面配置的那个接口。
 
+## 兼容的第三方动画
+
+本模组不自己画画面，只是**调度**已有的歌词动画模式。所以它天生就能指挥任何已安装的
+第三方 visualizer——第三方模式会出现在给 AI 的候选清单里，标着「（第三方）」。
+
+下面这些模式带**画面画像**（AI 知道它长什么样，因而选得更准）：
+
+| 模组 | mode id | 名字 |
+| --- | --- | --- |
+| `cinerama` | `mod:cinerama:cinerama-screen` | 巨幕 |
+| `visualizer-jump` | `mod:visualizer-jump:jump-course` | 跳一跳 |
+| `vinyl-disc` | `mod:vinyl-disc:disc` | 黑胶唱片 |
+| `wave-light` | `mod:wave-light:wave-light` | 动感波光 |
+| `visualizer52hz` | `mod:visualizer52hz:rings` | 52Hz |
+
+其它第三方 visualizer 照样能选，只是 AI 只拿到一句中性描述（「画面形态未知，但可正常播放」），
+选它的倾向会低一些。想让它更准，可以给本模组提 issue 补画像。
+
+**会被排除的模式**：委托型包装（自己不画、把画面转交给别的模式）不会进候选，例如
+`lyric-style-switcher` 的「随机」（`mod:lyric-style-switcher:random-lyric-style`）。
+本模组要按段决定画面，选中这类模式等于放弃控制。
+
+## 和其它模组的配合
+
+- **`k3panel`（商籁深度精调）**：「商籁」有两套参数——本模组用宿主内置的那套
+  （`cameraIntensity`、`typographyMotion`、`mgDensity` 等，经 `handleSetSonnetTuning` 写入），
+  k3panel 另有一套深调系数（`cameraScale`、`motionScale`、`breathScale` 等，走宿主的 `modTunings`）。
+  两套是**相乘**关系，互不干扰：AI 只碰内置那套，k3panel 的旋钮始终归你自己调。
+  提示词里已经写明，AI 不会去写那些键。
+- **其它模组的设置不会被动**：本模组只改写「当前歌词动画模式 / 该模式的样式参数 / 动画强度 /
+  背景类型」这四类，且第一次改之前存了快照，随时可以「恢复原来的设置」。
+- **和 `lyric-ai-director-plus` / `lyric-ai-director` 的关系**：这三个都是「AI 选动画」类模组，
+  功能重叠，建议**只开一个**，同时启用会互相抢着切模式。
+
 ## 内部接口
 
 这个模组用 `folium.internals` 读写宿主内部的 visualizer 设置 store 与注册表：
